@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>IsolationSIEM WS Test</title>
+</head>
+<body>
+    <h2>Live Telemetry Stream</h2>
+    <div id="status" style="color: red;">Disconnected</div>
+    <pre id="logs" style="background: #222; color: #0f0; padding: 15px; border-radius: 5px; max-height: 400px; overflow-y: auto;"></pre>
+
+    <script>
+        const statusDiv = document.getElementById('status');
+        const logsDiv = document.getElementById('logs');
+
+        // Connect directly via unencrypted WS locally
+        const socket = new WebSocket('ws://127.0.0.1:8080/ws');
+
+        socket.onopen = () => {
+            statusDiv.textContent = 'Connected to Go Ingestion Server!';
+            statusDiv.style.color = 'green';
+        };
+
+        socket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            logsDiv.textContent += JSON.stringify(data, null, 2) + '\n-------------------\n';
+        };
+
+        socket.onerror = (err) => {
+            console.error('WebSocket Error:', err);
+            statusDiv.textContent = 'Connection Error';
+            statusDiv.style.color = 'red';
+        };
+
+        socket.onclose = () => {
+            statusDiv.textContent = 'Disconnected';
+            statusDiv.style.color = 'red';
+        };
+    </script>
+</body>
+</html>
