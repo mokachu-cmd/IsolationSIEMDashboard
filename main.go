@@ -6,23 +6,37 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"isolation-siem-dashboard/pkg/ecs"
 	"isolation-siem-dashboard/pkg/kafka"
+	"isolation-siem-dashboard/pkg/storage"
 	"isolation-siem-dashboard/pkg/websocket"
 )
 
 type RawAgentLog struct {
-	AgentID   string `json:"agent_id"`
-	HostName  string `json:"host_name"`
-	EventType string `json:"event_type"`
-	Message   string `json:"message"`
+	AgentID      string  `json:"agent_id"`
+	HostName     string  `json:"host_name"`
+	EventType    string  `json:"event_type"`
+	Message      string  `json:"message"`
+	AnomalyScore float64 `json:"anomaly_score"` // Isolation Forest anomaly score (e.g., 0.0 to 1.0)
+}
+
+// Struct extending ECS payload with Severity & Anomaly details
+type EvaluatedAlert struct {
+	ecs.Event
+	AnomalyScore float64 `json:"anomaly_score"`
+	Severity     string  `json:"severity"`
 }
 
 var (
 	kafkaProducer *kafka.Producer
 	wsHub         *websocket.Hub
+	esClient      *storage.ESClient
 )
+
+// Predetermined anomaly threshold (e.g., scores >= 0.75 trigger persistence)
+const AnomalyThreshold = 0.75
 
 func ingestHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -36,41 +50,70 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Normalize raw log payload to ECS standard
-	ecsEvent := ecs.NormalizeAgentPayload(rawLog.HostName, rawLog.EventType, rawLog.Message)
+	// 1. Normalize payload
+	baseECS := ecs.NormalizeAgentPayload(rawLog.HostName, rawLog.EventType, rawLog.Message)
 
-	ecsBytes, err := json.Marshal(ecsEvent)
+	// 2. Evaluate Anomaly Score against Threshold
+	severity := "LOW"
+	if rawLog.AnomalyScore >= AnomalyThreshold {
+		severity = "HIGH_ANOMALY"
+	}
+
+	alertPayload := EvaluatedAlert{
+		Event:        baseECS,
+		AnomalyScore: rawLog.AnomalyScore,
+		Severity:     severity,
+	}
+
+	payloadBytes, err := json.Marshal(alertPayload)
 	if err != nil {
-		http.Error(w, "Failed to serialize ECS event", http.StatusInternalServerError)
+		http.Error(w, "Failed to serialize alert payload", http.StatusInternalServerError)
 		return
 	}
 
-	// 2. Broadcast live event directly to connected WebSockets (React UI)
-	wsHub.BroadcastEvent(ecsBytes)
+	// 3. Always stream live events to WebSocket
+	wsHub.BroadcastEvent(payloadBytes)
 
-	// 3. Publish normalized ECS payload to Kafka (non-blocking)
+	// 4. Threshold Check: Persist to Elasticsearch ONLY if score exceeds threshold
 	ctx := context.Background()
-	if kafkaProducer != nil {
-		_ = kafkaProducer.PublishEvent(ctx, ecsEvent.Host.Name, ecsBytes)
+	if rawLog.AnomalyScore >= AnomalyThreshold {
+		docID := fmt.Sprintf("%s-%d", rawLog.HostName, time.Now().UnixNano())
+		if esClient != nil {
+			go func() {
+				if err := esClient.IndexAlert(ctx, docID, payloadBytes); err != nil {
+					log.Printf("[ELASTICSEARCH ERROR] %v", err)
+				}
+			}()
+		}
+		fmt.Printf("[THRESHOLD EXCEEDED] Score: %.2f >= %.2f | Persisting to Elasticsearch\n", rawLog.AnomalyScore, AnomalyThreshold)
+	} else {
+		fmt.Printf("[LOG INGESTED] Score: %.2f < %.2f | Skipped Elasticsearch persistence\n", rawLog.AnomalyScore, AnomalyThreshold)
 	}
 
-	fmt.Printf("[INGESTED & BROADCAST] Host: %s | Action: %s\n", ecsEvent.Host.Name, ecsEvent.Event.Action)
+	// 5. Stream to Kafka (non-blocking)
+	if kafkaProducer != nil {
+		_ = kafkaProducer.PublishEvent(ctx, baseECS.Host.Name, payloadBytes)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ingested_and_streamed"}`))
+	w.Write([]byte(`{"status":"ingested"}`))
 }
 
 func main() {
-	// Initialize WebSocket Hub
 	wsHub = websocket.NewHub()
 	go wsHub.Run()
 
-	// Initialize Kafka Producer (Optional if testing without Docker)
+	// Connect to Elasticsearch (Default local instance at http://127.0.0.1:9200)
+	var err error
+	esClient, err = storage.NewESClient("http://127.0.0.1:9200", "isolation-siem-alerts")
+	if err != nil {
+		log.Printf("[WARNING] Could not connect to Elasticsearch: %v. Running in streaming-only mode.", err)
+	}
+
 	kafkaProducer = kafka.NewProducer("127.0.0.1:9092", "telemetry.raw")
 	defer kafkaProducer.Close()
 
-	// HTTP Routing
 	http.HandleFunc("/api/v1/ingest", ingestHandler)
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		wsHub.ServeWS(w, r)
@@ -78,8 +121,6 @@ func main() {
 
 	port := "127.0.0.1:8080"
 	fmt.Printf("IsolationSIEM Server listening on http://%s...\n", port)
-	fmt.Printf("WebSocket endpoint live at ws://%s/ws\n", port)
-
 	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}
